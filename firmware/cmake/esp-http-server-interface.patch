@@ -1,0 +1,75 @@
+Backport of Espressif commit 7e2e09c15c29f50495db5d677135beca30343dd5.
+Source: https://github.com/espressif/esp-idf/commit/7e2e09c15c29f50495db5d677135beca30343dd5
+Copyright Espressif Systems. SPDX-License-Identifier: Apache-2.0.
+This patch includes the two HTTP server source changes needed by Nearic.
+
+diff --git a/components/esp_http_server/include/esp_http_server.h b/components/esp_http_server/include/esp_http_server.h
+index b1a2197c9c38..b4beb20dd134 100644
+--- a/components/esp_http_server/include/esp_http_server.h
++++ b/components/esp_http_server/include/esp_http_server.h
+@@ -16,6 +16,7 @@
+ #include <esp_err.h>
+ #include <esp_event.h>
+ #include <esp_event_base.h>
++#include <net/if.h>
+
+ #ifdef __cplusplus
+ extern "C" {
+@@ -78,6 +79,7 @@ initializer that should be kept in sync
+         .keep_alive_idle = 0,                           \
+         .keep_alive_interval = 0,                       \
+         .keep_alive_count = 0,                          \
++        .if_name = NULL,                                \
+         .open_fn = NULL,                                \
+         .close_fn = NULL,                               \
+         .uri_match_fn = NULL                            \
+@@ -239,6 +241,10 @@ typedef struct httpd_config {
+     int keep_alive_idle;    /*!< Keep-alive idle time. Default is 5 (second) */
+     int keep_alive_interval;/*!< Keep-alive interval time. Default is 5 (second) */
+     int keep_alive_count;   /*!< Keep-alive packet retry send count. Default is 3 counts */
++    struct ifreq *if_name;  /*!< Bind server to a specific network interface.
++                               If NULL, server listens on all interfaces (INADDR_ANY).
++                               The pointer only needs to remain valid for the duration of
++                               httpd_start() -- it is not referenced after that call returns. */
+     /**
+      * Custom session opening callback.
+      *
+diff --git a/components/esp_http_server/src/httpd_main.c b/components/esp_http_server/src/httpd_main.c
+index 74331d92464f..ae2757669309 100644
+--- a/components/esp_http_server/src/httpd_main.c
++++ b/components/esp_http_server/src/httpd_main.c
+@@ -12,6 +12,7 @@
+ #include <esp_err.h>
+ #include <assert.h>
+ #include <netinet/tcp.h>
++#include <net/if.h>
+
+ #include <esp_http_server.h>
+ #include "esp_httpd_priv.h"
+@@ -386,6 +387,26 @@ static esp_err_t httpd_server_init(struct httpd_data *hd)
+         ESP_LOGW(TAG, LOG_FMT("error in setsockopt SO_REUSEADDR (%d)"), errno);
+     }
+
++    /* Bind to specific network interface if configured */
++    if (hd->config.if_name && hd->config.if_name->ifr_name[0] != 0) {
++        ESP_LOGI(TAG, LOG_FMT("Binding server to interface: %s"), hd->config.if_name->ifr_name);
++#ifndef __APPLE__
++        if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, hd->config.if_name, sizeof(struct ifreq)) < 0) {
++#else
++        int idx = if_nametoindex(hd->config.if_name->ifr_name);
++        if (idx == 0) {
++            ESP_LOGE(TAG, LOG_FMT("Invalid interface name %s"), hd->config.if_name->ifr_name);
++            close(fd);
++            return ESP_FAIL;
++        }
++        if (setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx)) < 0) {
++#endif
++            ESP_LOGE(TAG, LOG_FMT("Failed to bind to interface %s (%d)"), hd->config.if_name->ifr_name, errno);
++            close(fd);
++            return ESP_FAIL;
++        }
++    }
++
+     int ret = bind(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+     if (ret < 0) {
+         ESP_LOGE(TAG, LOG_FMT("error in bind (%d)"), errno);
