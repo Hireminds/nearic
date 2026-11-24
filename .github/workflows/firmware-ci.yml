@@ -1,0 +1,80 @@
+name: Firmware CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware:
+    name: Firmware build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Espressif ESP-IDF v5.5.6
+    container: espressif/idf@sha256:851f136a2c09cf17c13e952b9975606d7d1050be1480b1fd82c7ea4bce78cfb3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build for ESP32-S3
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$PWD"
+          source /opt/esp/idf/export.sh
+          idf.py -C firmware set-target esp32s3
+          idf.py -C firmware build
+          test -s firmware/build/nearic.bin
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            release_tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$'
+            if [[ ! "$GITHUB_REF_NAME" =~ $release_tag_pattern ]]; then
+              printf 'Invalid firmware release tag %s\n' "$GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+            image_version=$(python -m esptool --chip esp32s3 image_info --version 2 firmware/build/nearic.bin |
+              awk '$1 == "App" && $2 == "version:" {print $3}')
+            if [[ "$image_version" != "${GITHUB_REF_NAME#v}" ]]; then
+              printf 'Firmware version %s does not match tag %s\n' "$image_version" "$GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+          fi
+
+  spec-kit:
+    name: Spec Kit tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Install pinned Spec Kit
+        run: |
+          nearic_sdd_venv="$RUNNER_TEMP/nearic-sdd"
+          python3 -m venv "$nearic_sdd_venv"
+          "$nearic_sdd_venv/bin/python" -m pip --disable-pip-version-check install \
+            'git+https://github.com/github/spec-kit.git@980b3d027f4bd7958c35f97f618d854b41320e3f'
+          echo "$nearic_sdd_venv/bin" >> "$GITHUB_PATH"
+
+      - name: Check Spec Kit integration and workflows
+        run: |
+          specify integration status --json | jq -e '.status == "ok"'
+          for workflow in speckit bugfix assess; do
+            specify workflow resolve "$workflow"
+          done
+
+      - name: Run process tests
+        run: python3 -B -m unittest discover -s tests/process -v
+
+      - name: Check patch whitespace
+        run: git diff --check HEAD^ HEAD
